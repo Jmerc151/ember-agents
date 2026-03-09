@@ -1,0 +1,29 @@
+app = 'ember-agents-api'
+primary_region = 'sjc'
+
+[build]
+
+[processes]
+  app = 'node server/index.js'
+
+[env]
+  NODE_ENV = 'production'
+  DB_PATH = '/data/ember-agents.db'
+  PORT = '8080'
+
+[[mounts]]
+  source = 'ember_data'
+  destination = '/data'
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ['app']
+
+[[vm]]
+  memory = '1gb'
+  cpu_kind = 'shared'
+  cpus = 1
