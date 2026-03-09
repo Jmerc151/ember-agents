@@ -6,6 +6,7 @@ import db from './db.js'
 import { v4 as uuid } from 'uuid'
 import { readFileSync } from 'fs'
 import Anthropic from '@anthropic-ai/sdk'
+import webpush from 'web-push'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const app = express()
@@ -32,6 +33,22 @@ if (API_KEY) {
 
 // Anthropic client
 const anthropic = new Anthropic() // uses ANTHROPIC_API_KEY env var
+
+// Web Push setup
+const VAPID_PUBLIC = process.env.VAPID_PUBLIC_KEY || 'BJzTO_33QaJQKmSo6s639IQ8O3VdYIYB2AgcMmGA_6zroPrWL8UHho56bOqSp6pav6YGVFkdwe15ZnmVW6Z8W3M'
+const VAPID_PRIVATE = process.env.VAPID_PRIVATE_KEY || 'vkrHsFUbb4ZnhroYqUA5MzZzu8cbK1ZnTlltkf6_ixg'
+webpush.setVapidDetails('mailto:ember@agents.app', VAPID_PUBLIC, VAPID_PRIVATE)
+
+// In-memory push subscriptions (reset on restart, which is fine for free tier)
+const pushSubscriptions = new Set()
+
+function sendPushToAll(payload) {
+  for (const sub of pushSubscriptions) {
+    webpush.sendNotification(JSON.parse(sub), JSON.stringify(payload)).catch(() => {
+      pushSubscriptions.delete(sub)
+    })
+  }
+}
 
 // Load agent configs
 const agentsPath = join(__dirname, '..', 'agents', 'agents.json')
@@ -161,6 +178,14 @@ app.post('/api/tasks/:id/run', async (req, res) => {
     // Post completion to chat
     db.prepare('INSERT INTO messages (sender_id, sender_name, sender_avatar, sender_color, text) VALUES (?, ?, ?, ?, ?)')
       .run(agent.id, agent.name, agent.avatar, agent.color, `✅ Finished: "${task.title}"`)
+
+    // Push notification
+    sendPushToAll({
+      title: `${agent.avatar} ${agent.name} finished`,
+      body: task.title,
+      tag: `task-done-${task.id}`,
+      taskId: task.id
+    })
   } catch (err) {
     activeRuns.delete(agent.id)
     const errorMsg = err.name === 'AbortError' ? 'Stopped by user' : err.message
@@ -172,6 +197,14 @@ app.post('/api/tasks/:id/run', async (req, res) => {
     // Post failure to chat
     db.prepare('INSERT INTO messages (sender_id, sender_name, sender_avatar, sender_color, text) VALUES (?, ?, ?, ?, ?)')
       .run(agent.id, agent.name, agent.avatar, agent.color, `❌ Failed: "${task.title}" — ${errorMsg}`)
+
+    // Push notification
+    sendPushToAll({
+      title: `${agent.avatar} ${agent.name} failed`,
+      body: `${task.title} — ${errorMsg}`,
+      tag: `task-fail-${task.id}`,
+      taskId: task.id
+    })
   }
 })
 
@@ -304,6 +337,17 @@ Keep it to 8-12 messages total. Be conversational and specific.`
     db.prepare('INSERT INTO messages (sender_id, sender_name, sender_avatar, sender_color, text) VALUES (?, ?, ?, ?, ?)')
       .run('system', 'System', '⚠️', '#78716c', `Standup failed: ${err.message}`)
   }
+})
+
+// ── Push Notifications ───────────────────────────
+app.get('/api/push/vapid-key', (req, res) => {
+  res.json({ key: VAPID_PUBLIC })
+})
+
+app.post('/api/push/subscribe', (req, res) => {
+  const sub = JSON.stringify(req.body)
+  pushSubscriptions.add(sub)
+  res.json({ ok: true })
 })
 
 // ── Health check ──────────────────────────────────

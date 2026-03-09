@@ -48,4 +48,8 @@ export const api = {
   sendMessage: (data) => request('/messages', { method: 'POST', body: data }),
   clearMessages: () => request('/messages', { method: 'DELETE' }),
   triggerStandup: () => request('/chat/standup', { method: 'POST' }),
+
+  // Push notifications
+  getVapidKey: () => request('/push/vapid-key'),
+  subscribePush: (subscription) => request('/push/subscribe', { method: 'POST', body: subscription }),
 }

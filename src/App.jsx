@@ -29,6 +29,28 @@ export default function App() {
     return () => clearInterval(interval)
   }, [refresh])
 
+  // Subscribe to push notifications
+  useEffect(() => {
+    async function setupPush() {
+      if (!('serviceWorker' in navigator) || !('PushManager' in window)) return
+      try {
+        const reg = await navigator.serviceWorker.ready
+        const existing = await reg.pushManager.getSubscription()
+        if (existing) return // already subscribed
+
+        const { key } = await api.getVapidKey()
+        const sub = await reg.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: key
+        })
+        await api.subscribePush(sub.toJSON())
+      } catch (e) {
+        console.log('Push subscription skipped:', e.message)
+      }
+    }
+    setupPush()
+  }, [])
+
   const handleCreateTask = async (data) => {
     await api.createTask(data)
     setShowCreate(false)
