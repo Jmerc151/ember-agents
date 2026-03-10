@@ -2,6 +2,13 @@
   command = "npm run build"
   publish = "dist"
 
+# Proxy API calls to Lightsail VM (avoids mixed content HTTPS→HTTP)
+[[redirects]]
+  from = "/api/*"
+  to = "http://44.249.57.123:3334/api/:splat"
+  status = 200
+  force = true
+
 [[redirects]]
   from = "/*"
   to = "/index.html"
