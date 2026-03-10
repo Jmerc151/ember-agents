@@ -4,7 +4,7 @@ import { fileURLToPath } from 'url'
 import { dirname, join } from 'path'
 import db from './db.js'
 import { v4 as uuid } from 'uuid'
-import { readFileSync } from 'fs'
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs'
 import Anthropic from '@anthropic-ai/sdk'
 import webpush from 'web-push'
 
@@ -57,6 +57,172 @@ const agents = JSON.parse(readFileSync(agentsPath, 'utf8'))
 // Active agent runs (in-memory tracking)
 const activeRuns = new Map()
 
+// ══════════════════════════════════════════════════════
+// ██ IMPROVEMENT 1: AGENT MEMORY (OpenClaw-inspired) ██
+// ══════════════════════════════════════════════════════
+// Persistent markdown memory per agent — survives restarts
+// Agents remember what they've learned across tasks
+
+const MEMORY_DIR = join(__dirname, '..', 'memory')
+mkdirSync(MEMORY_DIR, { recursive: true })
+
+function getAgentMemoryPath(agentId) {
+  return join(MEMORY_DIR, `${agentId}.md`)
+}
+
+function readAgentMemory(agentId) {
+  const path = getAgentMemoryPath(agentId)
+  if (!existsSync(path)) return ''
+  return readFileSync(path, 'utf8')
+}
+
+function writeAgentMemory(agentId, content) {
+  writeFileSync(getAgentMemoryPath(agentId), content, 'utf8')
+}
+
+function appendAgentMemory(agentId, entry) {
+  const existing = readAgentMemory(agentId)
+  const timestamp = new Date().toISOString().slice(0, 16)
+  const newEntry = `\n## [${timestamp}] ${entry.title}\n${entry.content}\n`
+  writeAgentMemory(agentId, existing + newEntry)
+}
+
+// After task completion, ask Claude to extract learnings for memory
+async function updateAgentMemory(agent, task, output) {
+  try {
+    const currentMemory = readAgentMemory(agent.id)
+
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1024,
+      system: `You are a memory curator for ${agent.name} (${agent.role}). Extract the most important learnings, decisions, and context from completed work that would help this agent perform better on future tasks.
+
+Rules:
+- Be concise — bullet points, not paragraphs
+- Focus on: patterns discovered, decisions made, gotchas found, architecture notes
+- Skip generic knowledge — only save project-specific insights
+- If nothing new was learned, respond with just "NOTHING_NEW"
+
+Respond with ONLY the memory entry content (markdown bullets).`,
+      messages: [{
+        role: 'user',
+        content: `Task completed: "${task.title}"
+Output (first 2000 chars): ${output.slice(0, 2000)}
+
+Current memory (for context — avoid duplicates):
+${currentMemory.slice(-2000) || '(empty)'}`
+      }]
+    })
+
+    const text = response.content.map(b => b.type === 'text' ? b.text : '').join('')
+    if (text.includes('NOTHING_NEW')) return
+
+    appendAgentMemory(agent.id, { title: task.title, content: text.slice(0, 1000) })
+    console.log(`🧠 Memory updated for ${agent.name}`)
+  } catch (err) {
+    console.error(`Memory update failed for ${agent.name}:`, err.message)
+  }
+}
+
+
+// ══════════════════════════════════════════════════════
+// ██ IMPROVEMENT 2: TASK QUEUE (OpenClaw Lane Queue) ██
+// ══════════════════════════════════════════════════════
+// Per-agent serial queue — when one task finishes, auto-run the next
+// No more clicking "Run" for each task!
+
+const agentQueues = new Map() // agentId → { processing: boolean }
+
+async function processAgentQueue(agentId) {
+  if (agentQueues.get(agentId)?.processing) return // already processing
+  agentQueues.set(agentId, { processing: true })
+
+  try {
+    // Find next 'todo' task for this agent
+    const nextTask = db.prepare(
+      "SELECT * FROM tasks WHERE agent_id = ? AND status = 'todo' ORDER BY priority = 'critical' DESC, priority = 'high' DESC, priority = 'medium' DESC, created_at ASC LIMIT 1"
+    ).get(agentId)
+
+    if (!nextTask) {
+      agentQueues.set(agentId, { processing: false })
+      return
+    }
+
+    // Don't auto-run if agent is busy
+    if (activeRuns.has(agentId)) {
+      agentQueues.set(agentId, { processing: false })
+      return
+    }
+
+    console.log(`📋 Queue: auto-running "${nextTask.title}" for ${agentId}`)
+
+    // Trigger the task run via internal fetch
+    try {
+      const PORT = process.env.PORT || process.env.API_PORT || 3334
+      await fetch(`http://localhost:${PORT}/api/tasks/${nextTask.id}/run`, { method: 'POST' })
+    } catch (e) {
+      console.error('Queue auto-run failed:', e.message)
+    }
+  } finally {
+    agentQueues.set(agentId, { processing: false })
+  }
+}
+
+// Check all agent queues periodically (every 30 seconds)
+setInterval(() => {
+  for (const agent of agents) {
+    if (!activeRuns.has(agent.id)) {
+      processAgentQueue(agent.id)
+    }
+  }
+}, 30000)
+
+
+// ══════════════════════════════════════════════════════
+// ██ IMPROVEMENT 5: INTER-AGENT CHAT                 ██
+// ══════════════════════════════════════════════════════
+// Agents can consult each other mid-task via structured queries
+
+async function agentConsult(fromAgent, toAgentId, question, taskContext) {
+  const toAgent = agents.find(a => a.id === toAgentId)
+  if (!toAgent) return null
+
+  try {
+    const toMemory = readAgentMemory(toAgentId)
+
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 2048,
+      system: `${toAgent.systemPrompt}
+
+You are being consulted by ${fromAgent.name} (${fromAgent.role}) about a task they're working on. Answer their question using your expertise. Be concise and actionable.
+
+Your accumulated knowledge:
+${toMemory.slice(-1500) || '(no prior knowledge)'}`,
+      messages: [{
+        role: 'user',
+        content: `Question from ${fromAgent.name}:\n${question}\n\nTask context:\n${taskContext}`
+      }]
+    })
+
+    const answer = response.content.map(b => b.type === 'text' ? b.text : '').join('')
+
+    // Log the consultation to chat
+    db.prepare('INSERT INTO messages (sender_id, sender_name, sender_avatar, sender_color, text) VALUES (?, ?, ?, ?, ?)')
+      .run(fromAgent.id, fromAgent.name, fromAgent.avatar, fromAgent.color,
+        `💬 @${toAgent.name}: ${question.slice(0, 200)}`)
+    db.prepare('INSERT INTO messages (sender_id, sender_name, sender_avatar, sender_color, text) VALUES (?, ?, ?, ?, ?)')
+      .run(toAgent.id, toAgent.name, toAgent.avatar, toAgent.color,
+        `↩️ Re: ${fromAgent.name}'s question:\n${answer.slice(0, 500)}`)
+
+    return answer
+  } catch (err) {
+    console.error(`Consultation ${fromAgent.id} → ${toAgentId} failed:`, err.message)
+    return null
+  }
+}
+
+
 // ── Auto Task Generation ────────────────────────────
 async function generateFollowUpTasks(completedTask, agent, output) {
   try {
@@ -92,7 +258,6 @@ Generate follow-up tasks as JSON array:`
     })
 
     const text = response.content.map(b => b.type === 'text' ? b.text : '').join('')
-    // Extract JSON from response (handle markdown code blocks)
     const jsonMatch = text.match(/\[[\s\S]*\]/)
     if (!jsonMatch) return
 
@@ -100,7 +265,6 @@ Generate follow-up tasks as JSON array:`
     const created = []
 
     for (const t of newTasks.slice(0, 3)) {
-      // Validate agent_id exists
       const validAgent = agents.find(a => a.id === t.agent_id)
       if (!validAgent || !t.title) continue
 
@@ -109,7 +273,7 @@ Generate follow-up tasks as JSON array:`
         INSERT INTO tasks (id, title, description, priority, agent_id, status)
         VALUES (?, ?, ?, ?, ?, 'todo')
       `).run(id, t.title, t.description || '', t.priority || 'medium', t.agent_id)
-      created.push({ title: t.title, agent: validAgent.name })
+      created.push({ title: t.title, agent: validAgent.name, agentId: t.agent_id })
     }
 
     if (created.length > 0) {
@@ -118,6 +282,12 @@ Generate follow-up tasks as JSON array:`
         .run('system', '🧠 Task Planner', '🧠', '#a855f7', `Generated ${created.length} follow-up task${created.length > 1 ? 's' : ''}:\n${taskList}`)
 
       console.log(`🧠 Auto-generated ${created.length} follow-up tasks from "${completedTask.title}"`)
+
+      // Trigger queue processing for agents that got new tasks
+      const affectedAgents = [...new Set(created.map(t => t.agentId))]
+      for (const agentId of affectedAgents) {
+        setTimeout(() => processAgentQueue(agentId), 5000)
+      }
     }
   } catch (err) {
     console.error('Auto-task generation failed:', err.message)
@@ -127,11 +297,12 @@ Generate follow-up tasks as JSON array:`
 // ── QA Review — Sentinel auto-reviews completed work ────────
 async function reviewCompletedWork(completedTask, agent, output) {
   try {
-    // Don't review Sentinel's own work (avoid infinite loop)
     if (agent.id === 'sentinel') return
 
     const sentinel = agents.find(a => a.id === 'sentinel')
     if (!sentinel) return
+
+    const sentinelMemory = readAgentMemory('sentinel')
 
     db.prepare('INSERT INTO task_logs (task_id, agent_id, message, type) VALUES (?, ?, ?, ?)')
       .run(completedTask.id, 'sentinel', 'Sentinel is reviewing this work...', 'info')
@@ -147,6 +318,9 @@ Your job is to review the agent's work output and evaluate:
 3. **Quality** — Code style, best practices, edge cases, error handling?
 4. **Security** — Any SQL injection, XSS, auth issues, data leaks?
 5. **Performance** — Any obvious performance problems?
+
+Your accumulated review knowledge:
+${sentinelMemory.slice(-1500) || '(no prior reviews)'}
 
 Provide a clear verdict and score. Be specific about issues found.
 
@@ -170,24 +344,20 @@ ${output.slice(0, 4000)}`
 
     const review = response.content.map(b => b.type === 'text' ? b.text : '').join('')
 
-    // Extract verdict
     const verdictMatch = review.match(/Verdict:\s*(PASS|NEEDS WORK|FAIL)/i)
     const scoreMatch = review.match(/Score:\s*(\d+)\/10/i)
     const verdict = verdictMatch ? verdictMatch[1].toUpperCase() : 'UNKNOWN'
     const score = scoreMatch ? parseInt(scoreMatch[1]) : null
 
-    // Log the review
     db.prepare('INSERT INTO task_logs (task_id, agent_id, message, type) VALUES (?, ?, ?, ?)')
       .run(completedTask.id, 'sentinel', review.slice(0, 5000), verdict === 'PASS' ? 'success' : 'warning')
 
-    // Post review to chat
     const emoji = verdict === 'PASS' ? '✅' : verdict === 'FAIL' ? '🚨' : '⚠️'
     const shortReview = review.length > 500 ? review.slice(0, 500) + '…' : review
     db.prepare('INSERT INTO messages (sender_id, sender_name, sender_avatar, sender_color, text) VALUES (?, ?, ?, ?, ?)')
       .run('sentinel', sentinel.name, sentinel.avatar, sentinel.color,
         `${emoji} **Review of "${completedTask.title}"** (by ${agent.name}):\n\n${shortReview}`)
 
-    // If FAIL or low score, create a fix task for the original agent
     if (verdict === 'FAIL' || (score !== null && score <= 4)) {
       const fixId = uuid()
       db.prepare(`
@@ -199,7 +369,8 @@ ${output.slice(0, 4000)}`
         .run('sentinel', sentinel.name, sentinel.avatar, sentinel.color,
           `🔁 Created fix task for ${agent.name}: issues found in "${completedTask.title}"`)
 
-      console.log(`🛡️ Sentinel FAILED "${completedTask.title}" — fix task created for ${agent.name}`)
+      // Trigger queue for the agent that needs to fix
+      setTimeout(() => processAgentQueue(agent.id), 5000)
     }
 
     console.log(`🛡️ Sentinel reviewed "${completedTask.title}": ${verdict} ${score ? `(${score}/10)` : ''}`)
@@ -221,14 +392,12 @@ async function troubleshootAndRetry(failedTask, agent, errorMsg) {
       return
     }
 
-    // Get previous task logs for context
     const logs = db.prepare('SELECT message, type FROM task_logs WHERE task_id = ? ORDER BY created_at ASC').all(failedTask.id)
     const logContext = logs.map(l => `[${l.type}] ${l.message}`).join('\n')
 
     db.prepare('INSERT INTO task_logs (task_id, agent_id, message, type) VALUES (?, ?, ?, ?)')
       .run(failedTask.id, 'system', `Troubleshooting failure (attempt ${retries + 1}/${MAX_RETRIES})...`, 'info')
 
-    // Ask Claude to diagnose the failure and suggest a fix
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 2048,
@@ -266,7 +435,6 @@ ${logContext.slice(0, 2000)}`
 
     const diagnosis = JSON.parse(jsonMatch[0])
 
-    // Post diagnosis to chat
     db.prepare('INSERT INTO messages (sender_id, sender_name, sender_avatar, sender_color, text) VALUES (?, ?, ?, ?, ?)')
       .run('system', '🔧 Troubleshooter', '🔧', '#ef4444',
         `🔍 Diagnosed "${failedTask.title}":\n\n**Problem:** ${diagnosis.diagnosis}\n**Fix:** ${diagnosis.fix}\n**Retryable:** ${diagnosis.retryable ? 'Yes — retrying now' : 'No — needs manual intervention'}`)
@@ -275,7 +443,6 @@ ${logContext.slice(0, 2000)}`
       .run(failedTask.id, 'system', `Diagnosis: ${diagnosis.diagnosis}\nFix: ${diagnosis.fix}`, 'warning')
 
     if (diagnosis.retryable && diagnosis.improved_description) {
-      // Update the task with improved description and reset for retry
       const newDesc = `${diagnosis.improved_description}\n\n---\n⚠️ Previous attempt failed: ${diagnosis.diagnosis}\nFix applied: ${diagnosis.fix}`
       db.prepare(`UPDATE tasks SET status = 'todo', description = ?, error = '', retries = ?, completed_at = NULL, started_at = NULL, updated_at = datetime('now') WHERE id = ?`)
         .run(newDesc, retries + 1, failedTask.id)
@@ -283,22 +450,9 @@ ${logContext.slice(0, 2000)}`
       db.prepare('INSERT INTO task_logs (task_id, agent_id, message, type) VALUES (?, ?, ?, ?)')
         .run(failedTask.id, 'system', `Task reset for retry (${retries + 1}/${MAX_RETRIES}) with improved description`, 'info')
 
-      // Auto-run the retry after a short delay
-      setTimeout(async () => {
-        try {
-          const freshTask = db.prepare('SELECT * FROM tasks WHERE id = ?').get(failedTask.id)
-          if (!freshTask || freshTask.status !== 'todo') return
-          // Trigger the run internally
-          const runRes = await fetch(`http://localhost:${process.env.PORT || process.env.API_PORT || 3334}/api/tasks/${failedTask.id}/run`, { method: 'POST' })
-          if (runRes.ok) {
-            console.log(`🔧 Auto-retrying "${failedTask.title}" (attempt ${retries + 2})`)
-          }
-        } catch (e) {
-          console.error('Auto-retry fetch failed:', e.message)
-        }
-      }, 3000)
+      // Queue will auto-pick it up
+      setTimeout(() => processAgentQueue(agent.id), 5000)
     } else {
-      // Not retryable — mark as needs manual attention
       db.prepare('INSERT INTO task_logs (task_id, agent_id, message, type) VALUES (?, ?, ?, ?)')
         .run(failedTask.id, 'system', 'Task requires manual intervention — not auto-retryable', 'error')
     }
@@ -308,6 +462,66 @@ ${logContext.slice(0, 2000)}`
     console.error('Troubleshooting failed:', err.message)
   }
 }
+
+
+// ══════════════════════════════════════════════════════
+// ██ IMPROVEMENT 4: HEARTBEAT / CRON SCHEDULER       ██
+// ══════════════════════════════════════════════════════
+// Scheduled proactive tasks — agents wake up on their own
+
+const heartbeatJobs = []
+
+function registerHeartbeat(name, intervalMs, fn) {
+  const id = setInterval(fn, intervalMs)
+  heartbeatJobs.push({ name, id, intervalMs })
+  console.log(`💓 Heartbeat registered: ${name} (every ${Math.round(intervalMs / 60000)}min)`)
+}
+
+// Daily standup at startup + every 8 hours
+registerHeartbeat('auto-standup', 8 * 60 * 60 * 1000, async () => {
+  try {
+    const PORT = process.env.PORT || process.env.API_PORT || 3334
+    await fetch(`http://localhost:${PORT}/api/chat/standup`, { method: 'POST' })
+    console.log('💓 Auto-standup triggered')
+  } catch (e) {
+    console.error('Auto-standup failed:', e.message)
+  }
+})
+
+// Queue monitor — every 60 seconds, check for idle agents with pending tasks
+registerHeartbeat('queue-monitor', 60000, () => {
+  for (const agent of agents) {
+    if (!activeRuns.has(agent.id)) {
+      const pendingCount = db.prepare("SELECT COUNT(*) as count FROM tasks WHERE agent_id = ? AND status = 'todo'").get(agent.id)?.count || 0
+      if (pendingCount > 0) {
+        processAgentQueue(agent.id)
+      }
+    }
+  }
+})
+
+// Memory compaction — every 24 hours, trim agent memories to prevent bloat
+registerHeartbeat('memory-compaction', 24 * 60 * 60 * 1000, async () => {
+  for (const agent of agents) {
+    const memory = readAgentMemory(agent.id)
+    if (memory.length > 10000) {
+      try {
+        const response = await anthropic.messages.create({
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 2048,
+          system: `Compact this agent memory to the most important 50% of content. Keep the most valuable learnings, remove redundant or outdated entries. Preserve markdown formatting.`,
+          messages: [{ role: 'user', content: memory }]
+        })
+        const compacted = response.content.map(b => b.type === 'text' ? b.text : '').join('')
+        writeAgentMemory(agent.id, compacted)
+        console.log(`🧹 Compacted memory for ${agent.name}: ${memory.length} → ${compacted.length} chars`)
+      } catch (e) {
+        console.error(`Memory compaction failed for ${agent.name}:`, e.message)
+      }
+    }
+  }
+})
+
 
 // ── Agents ─────────────────────────────────────────
 app.get('/api/agents', (req, res) => {
@@ -326,10 +540,39 @@ app.get('/api/agents', (req, res) => {
         completed: counts.filter(c => c.status === 'done').reduce((s, c) => s + c.count, 0),
         total: counts.reduce((s, c) => s + c.count, 0)
       },
-      isRunning: activeRuns.has(agent.id)
+      isRunning: activeRuns.has(agent.id),
+      hasMemory: readAgentMemory(agent.id).length > 0
     }
   })
   res.json(enriched)
+})
+
+// ── Agent Memory API ──────────────────────────────
+app.get('/api/agents/:id/memory', (req, res) => {
+  const memory = readAgentMemory(req.params.id)
+  res.json({ agent_id: req.params.id, memory, length: memory.length })
+})
+
+app.delete('/api/agents/:id/memory', (req, res) => {
+  writeAgentMemory(req.params.id, '')
+  res.json({ ok: true, message: 'Memory cleared' })
+})
+
+// ── Inter-Agent Consult API ───────────────────────
+app.post('/api/agents/:fromId/consult/:toId', async (req, res) => {
+  const fromAgent = agents.find(a => a.id === req.params.fromId)
+  const toAgent = agents.find(a => a.id === req.params.toId)
+  if (!fromAgent || !toAgent) return res.status(404).json({ error: 'Agent not found' })
+
+  const { question, context } = req.body
+  if (!question) return res.status(400).json({ error: 'Question required' })
+
+  res.json({ ok: true, message: `${fromAgent.name} is consulting ${toAgent.name}...` })
+
+  const answer = await agentConsult(fromAgent, req.params.toId, question, context || '')
+  if (answer) {
+    console.log(`💬 ${fromAgent.name} consulted ${toAgent.name}`)
+  }
 })
 
 // ── Tasks CRUD ─────────────────────────────────────
@@ -348,6 +591,11 @@ app.post('/api/tasks', (req, res) => {
 
   const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(id)
   res.status(201).json(task)
+
+  // Trigger queue if agent assigned
+  if (agent_id) {
+    setTimeout(() => processAgentQueue(agent_id), 2000)
+  }
 })
 
 app.patch('/api/tasks/:id', (req, res) => {
@@ -384,7 +632,12 @@ app.get('/api/tasks/:id/logs', (req, res) => {
   res.json(logs)
 })
 
-// ── Run Agent (Anthropic API) ─────────────────────
+// ══════════════════════════════════════════════════════
+// ██ IMPROVEMENT 3: ReAct LOOP (Reason → Act → Loop) ██
+// ══════════════════════════════════════════════════════
+// Multi-step reasoning instead of single-shot API call
+// Agent can: think, consult other agents, search memory, iterate
+
 app.post('/api/tasks/:id/run', async (req, res) => {
   const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(req.params.id)
   if (!task) return res.status(404).json({ error: 'Task not found' })
@@ -407,28 +660,80 @@ app.post('/api/tasks/:id/run', async (req, res) => {
 
   res.json({ ok: true, message: `Agent ${agent.name} is working on it` })
 
-  // Run async — don't block the response
+  // ── ReAct Loop ──────────────────────────────────
   try {
-    const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 8192,
-      system: agent.systemPrompt,
-      messages: [{
-        role: 'user',
-        content: `Task: ${task.title}\n\nDetails: ${task.description || 'No additional details.'}\n\nPlease analyze this task and provide a detailed plan with code changes needed. Since you don't have direct file access, provide complete code snippets and clear instructions for implementation.`
-      }],
-    }, { signal: abortController.signal })
+    const agentMemory = readAgentMemory(agent.id)
+    const MAX_STEPS = 3
+    let messages = []
+    let fullOutput = ''
 
-    const output = response.content.map(b => b.type === 'text' ? b.text : '').join('\n')
+    // Step 1: Initial reasoning with memory + context
+    const initialPrompt = `Task: ${task.title}
+
+Details: ${task.description || 'No additional details.'}
+
+${agentMemory ? `## Your Memory (learnings from past tasks):\n${agentMemory.slice(-2000)}\n` : ''}
+
+## Instructions
+You are working on this task using a multi-step approach:
+1. First, THINK about the task and what you need to do
+2. If you need input from another agent, say: [CONSULT:agent_id] question here
+   Available agents: ${agents.filter(a => a.id !== agent.id).map(a => `${a.id} (${a.name} - ${a.role})`).join(', ')}
+3. Provide your solution with complete code snippets and clear instructions
+
+Start by analyzing the task and providing your approach.`
+
+    messages.push({ role: 'user', content: initialPrompt })
+
+    for (let step = 0; step < MAX_STEPS; step++) {
+      if (abortController.signal.aborted) throw new Error('AbortError')
+
+      db.prepare('INSERT INTO task_logs (task_id, agent_id, message, type) VALUES (?, ?, ?, ?)')
+        .run(task.id, agent.id, `ReAct step ${step + 1}/${MAX_STEPS}...`, 'info')
+
+      const response = await anthropic.messages.create({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 8192,
+        system: agent.systemPrompt,
+        messages,
+      }, { signal: abortController.signal })
+
+      const stepOutput = response.content.map(b => b.type === 'text' ? b.text : '').join('\n')
+      fullOutput += `\n--- Step ${step + 1} ---\n${stepOutput}`
+      messages.push({ role: 'assistant', content: stepOutput })
+
+      // Check for consultation requests
+      const consultMatch = stepOutput.match(/\[CONSULT:(\w+)\]\s*(.+)/s)
+      if (consultMatch && step < MAX_STEPS - 1) {
+        const [, targetAgentId, question] = consultMatch
+        db.prepare('INSERT INTO task_logs (task_id, agent_id, message, type) VALUES (?, ?, ?, ?)')
+          .run(task.id, agent.id, `Consulting ${targetAgentId}: ${question.slice(0, 200)}`, 'info')
+
+        const consultResponse = await agentConsult(agent, targetAgentId, question, `Task: ${task.title}`)
+
+        if (consultResponse) {
+          messages.push({
+            role: 'user',
+            content: `Response from ${targetAgentId}:\n${consultResponse}\n\nNow continue with your task, incorporating this input.`
+          })
+          continue // Do another ReAct step with the consultation result
+        }
+      }
+
+      // Check if agent indicates it's done (no more consultation needed)
+      if (!consultMatch || step === MAX_STEPS - 1) {
+        break // Done — no more steps needed
+      }
+    }
 
     activeRuns.delete(agent.id)
     db.prepare(`UPDATE tasks SET status = 'done', output = ?, completed_at = datetime('now'), updated_at = datetime('now') WHERE id = ?`)
-      .run(output.slice(0, 50000), task.id)
+      .run(fullOutput.slice(0, 50000), task.id)
     db.prepare('INSERT INTO task_logs (task_id, agent_id, message, type) VALUES (?, ?, ?, ?)')
       .run(task.id, agent.id, 'Task completed successfully', 'success')
 
     // Post completion to chat with summary
-    const summary = output.length > 300 ? output.slice(0, 300) + '…' : output
+    const summary = fullOutput.length > 300 ? fullOutput.slice(0, 300) + '…' : fullOutput
     db.prepare('INSERT INTO messages (sender_id, sender_name, sender_avatar, sender_color, text) VALUES (?, ?, ?, ?, ?)')
       .run(agent.id, agent.name, agent.avatar, agent.color, `✅ Finished: "${task.title}"\n\n${summary}`)
 
@@ -440,23 +745,24 @@ app.post('/api/tasks/:id/run', async (req, res) => {
       taskId: task.id
     })
 
-    // QA Review — Sentinel checks the work, then generate follow-ups
-    reviewCompletedWork(task, agent, output)
-      .then(() => generateFollowUpTasks(task, agent, output))
+    // Update agent memory, then QA review, then generate follow-ups, then queue next
+    updateAgentMemory(agent, task, fullOutput)
+      .then(() => reviewCompletedWork(task, agent, fullOutput))
+      .then(() => generateFollowUpTasks(task, agent, fullOutput))
+      .then(() => { setTimeout(() => processAgentQueue(agent.id), 5000) })
       .catch(() => {})
+
   } catch (err) {
     activeRuns.delete(agent.id)
-    const errorMsg = err.name === 'AbortError' ? 'Stopped by user' : err.message
+    const errorMsg = err.name === 'AbortError' || err.message === 'AbortError' ? 'Stopped by user' : err.message
     db.prepare(`UPDATE tasks SET status = 'failed', error = ?, completed_at = datetime('now'), updated_at = datetime('now') WHERE id = ?`)
       .run(errorMsg, task.id)
     db.prepare('INSERT INTO task_logs (task_id, agent_id, message, type) VALUES (?, ?, ?, ?)')
       .run(task.id, agent.id, `Task failed: ${errorMsg}`, 'error')
 
-    // Post failure to chat
     db.prepare('INSERT INTO messages (sender_id, sender_name, sender_avatar, sender_color, text) VALUES (?, ?, ?, ?, ?)')
       .run(agent.id, agent.name, agent.avatar, agent.color, `❌ Failed: "${task.title}" — ${errorMsg}`)
 
-    // Push notification
     sendPushToAll({
       title: `${agent.avatar} ${agent.name} failed`,
       body: `${task.title} — ${errorMsg}`,
@@ -464,8 +770,7 @@ app.post('/api/tasks/:id/run', async (req, res) => {
       taskId: task.id
     })
 
-    // Auto-troubleshoot & retry (skip if user manually stopped)
-    if (err.name !== 'AbortError') {
+    if (errorMsg !== 'Stopped by user') {
       troubleshootAndRetry(task, agent, errorMsg).catch(() => {})
     }
   }
@@ -493,6 +798,22 @@ app.get('/api/stats', (req, res) => {
   const recent = db.prepare("SELECT * FROM tasks WHERE completed_at IS NOT NULL ORDER BY completed_at DESC LIMIT 5").all()
 
   res.json({ total, byStatus, byAgent, recent })
+})
+
+// ── Heartbeat Status API ──────────────────────────
+app.get('/api/heartbeat', (req, res) => {
+  res.json({
+    jobs: heartbeatJobs.map(j => ({
+      name: j.name,
+      intervalMinutes: Math.round(j.intervalMs / 60000)
+    })),
+    queueStatus: agents.map(a => ({
+      agentId: a.id,
+      name: a.name,
+      isRunning: activeRuns.has(a.id),
+      pendingTasks: db.prepare("SELECT COUNT(*) as count FROM tasks WHERE agent_id = ? AND status = 'todo'").get(a.id)?.count || 0
+    }))
+  })
 })
 
 // ── Chat Messages ─────────────────────────────────
@@ -538,7 +859,6 @@ app.post('/api/chat/standup', async (req, res) => {
 
   res.json({ ok: true, message: 'Standup initiated' })
 
-  // Run async
   try {
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
@@ -612,7 +932,14 @@ app.post('/api/push/subscribe', (req, res) => {
 
 // ── Health check ──────────────────────────────────
 app.get('/api/health', (req, res) => {
-  res.json({ ok: true, uptime: process.uptime(), agents: agents.length })
+  res.json({
+    ok: true,
+    uptime: process.uptime(),
+    agents: agents.length,
+    activeRuns: activeRuns.size,
+    heartbeats: heartbeatJobs.length,
+    memoryDir: MEMORY_DIR
+  })
 })
 
 // ── Serve static in production ────────────────────
@@ -627,4 +954,7 @@ if (process.env.NODE_ENV === 'production') {
 const PORT = process.env.PORT || process.env.API_PORT || 3334
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🔥 Ember Agents server running on port ${PORT}`)
+  console.log(`🧠 Agent memory dir: ${MEMORY_DIR}`)
+  console.log(`📋 Task queues active for ${agents.length} agents`)
+  console.log(`💓 ${heartbeatJobs.length} heartbeat jobs registered`)
 })
