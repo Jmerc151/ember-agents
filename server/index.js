@@ -282,7 +282,7 @@ app.post('/api/chat/standup', async (req, res) => {
       max_tokens: 2048,
       messages: [{
         role: 'user',
-        content: `You are simulating a quick team standup meeting between 5 AI agents working on Ember, a restaurant kitchen management SaaS. Each agent has a distinct personality and role.
+        content: `You are simulating a quick team standup meeting between ${agents.length} AI agents working on Ember, a restaurant kitchen management SaaS. Each agent has a distinct personality and role.
 
 The team:
 ${agentProfiles}
@@ -297,11 +297,7 @@ Generate a natural, brief team standup conversation. Each agent should speak 1-2
 - Be concise and natural — like a real dev team standup
 
 CRITICAL FORMAT: Output ONLY lines in this exact format, one per message. No other text:
-PHOENIX: message text here
-FORGE: message text here
-SENTINEL: message text here
-PRISM: message text here
-ATLAS: message text here
+${agents.map(a => a.name.toUpperCase() + ': message text here').join('\n')}
 
 Keep it to 8-12 messages total. Be conversational and specific.`
       }]
@@ -315,7 +311,8 @@ Keep it to 8-12 messages total. Be conversational and specific.`
     let delay = 0
 
     for (const line of lines) {
-      const match = line.match(/^(PHOENIX|FORGE|SENTINEL|PRISM|ATLAS):\s*(.+)/i)
+      const agentPattern = agents.map(a => a.name.toUpperCase()).join('|')
+      const match = line.match(new RegExp(`^(${agentPattern}):\\s*(.+)`, 'i'))
       if (!match) continue
       const agent = agentMap[match[1].toUpperCase()]
       if (!agent) continue
