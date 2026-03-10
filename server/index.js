@@ -57,6 +57,73 @@ const agents = JSON.parse(readFileSync(agentsPath, 'utf8'))
 // Active agent runs (in-memory tracking)
 const activeRuns = new Map()
 
+// ── Auto Task Generation ────────────────────────────
+async function generateFollowUpTasks(completedTask, agent, output) {
+  try {
+    const allTasks = db.prepare('SELECT title, status, agent_id FROM tasks ORDER BY created_at DESC LIMIT 20').all()
+    const taskContext = allTasks.map(t => `- [${t.status}] ${t.title}`).join('\n')
+
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 2048,
+      system: `You are a technical project manager for Ember, a restaurant kitchen management SaaS (React 19 + Vite frontend, Express + PostgreSQL backend).
+
+Available agents and their specialties:
+${agents.map(a => `- ${a.id}: ${a.name} (${a.role}) — ${a.description}`).join('\n')}
+
+Generate 1-3 follow-up tasks based on completed work. Each task should be actionable, specific, and assigned to the most appropriate agent. Focus on real improvements: bug fixes, tests, optimizations, new features, or polish.
+
+IMPORTANT: Do NOT duplicate existing tasks. Do NOT create vague tasks. Each must be concrete enough for an agent to execute.
+
+Respond with ONLY valid JSON — an array of objects with: title, description, agent_id, priority (low/medium/high)`,
+      messages: [{
+        role: 'user',
+        content: `Completed task: "${completedTask.title}"
+Agent: ${agent.name} (${agent.role})
+
+Output summary (first 2000 chars):
+${output.slice(0, 2000)}
+
+Existing tasks (avoid duplicates):
+${taskContext}
+
+Generate follow-up tasks as JSON array:`
+      }]
+    })
+
+    const text = response.content.map(b => b.type === 'text' ? b.text : '').join('')
+    // Extract JSON from response (handle markdown code blocks)
+    const jsonMatch = text.match(/\[[\s\S]*\]/)
+    if (!jsonMatch) return
+
+    const newTasks = JSON.parse(jsonMatch[0])
+    const created = []
+
+    for (const t of newTasks.slice(0, 3)) {
+      // Validate agent_id exists
+      const validAgent = agents.find(a => a.id === t.agent_id)
+      if (!validAgent || !t.title) continue
+
+      const id = uuid()
+      db.prepare(`
+        INSERT INTO tasks (id, title, description, priority, agent_id, status)
+        VALUES (?, ?, ?, ?, ?, 'todo')
+      `).run(id, t.title, t.description || '', t.priority || 'medium', t.agent_id)
+      created.push({ title: t.title, agent: validAgent.name })
+    }
+
+    if (created.length > 0) {
+      const taskList = created.map(t => `• ${t.title} → ${t.agent}`).join('\n')
+      db.prepare('INSERT INTO messages (sender_id, sender_name, sender_avatar, sender_color, text) VALUES (?, ?, ?, ?, ?)')
+        .run('system', '🧠 Task Planner', '🧠', '#a855f7', `Generated ${created.length} follow-up task${created.length > 1 ? 's' : ''}:\n${taskList}`)
+
+      console.log(`🧠 Auto-generated ${created.length} follow-up tasks from "${completedTask.title}"`)
+    }
+  } catch (err) {
+    console.error('Auto-task generation failed:', err.message)
+  }
+}
+
 // ── Agents ─────────────────────────────────────────
 app.get('/api/agents', (req, res) => {
   const taskCounts = db.prepare(`
@@ -175,9 +242,10 @@ app.post('/api/tasks/:id/run', async (req, res) => {
     db.prepare('INSERT INTO task_logs (task_id, agent_id, message, type) VALUES (?, ?, ?, ?)')
       .run(task.id, agent.id, 'Task completed successfully', 'success')
 
-    // Post completion to chat
+    // Post completion to chat with summary
+    const summary = output.length > 300 ? output.slice(0, 300) + '…' : output
     db.prepare('INSERT INTO messages (sender_id, sender_name, sender_avatar, sender_color, text) VALUES (?, ?, ?, ?, ?)')
-      .run(agent.id, agent.name, agent.avatar, agent.color, `✅ Finished: "${task.title}"`)
+      .run(agent.id, agent.name, agent.avatar, agent.color, `✅ Finished: "${task.title}"\n\n${summary}`)
 
     // Push notification
     sendPushToAll({
@@ -186,6 +254,9 @@ app.post('/api/tasks/:id/run', async (req, res) => {
       tag: `task-done-${task.id}`,
       taskId: task.id
     })
+
+    // Auto-generate follow-up tasks
+    generateFollowUpTasks(task, agent, output).catch(() => {})
   } catch (err) {
     activeRuns.delete(agent.id)
     const errorMsg = err.name === 'AbortError' ? 'Stopped by user' : err.message
