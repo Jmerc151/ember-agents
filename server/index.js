@@ -208,6 +208,107 @@ ${output.slice(0, 4000)}`
   }
 }
 
+// ── Auto-Troubleshoot & Retry Failed Tasks ──────────
+const MAX_RETRIES = 2
+
+async function troubleshootAndRetry(failedTask, agent, errorMsg) {
+  try {
+    const retries = failedTask.retries || 0
+    if (retries >= MAX_RETRIES) {
+      db.prepare('INSERT INTO messages (sender_id, sender_name, sender_avatar, sender_color, text) VALUES (?, ?, ?, ?, ?)')
+        .run('system', '🔧 Troubleshooter', '🔧', '#ef4444', `⛔ "${failedTask.title}" failed ${MAX_RETRIES} times — giving up. Needs manual review.`)
+      console.log(`🔧 Max retries reached for "${failedTask.title}"`)
+      return
+    }
+
+    // Get previous task logs for context
+    const logs = db.prepare('SELECT message, type FROM task_logs WHERE task_id = ? ORDER BY created_at ASC').all(failedTask.id)
+    const logContext = logs.map(l => `[${l.type}] ${l.message}`).join('\n')
+
+    db.prepare('INSERT INTO task_logs (task_id, agent_id, message, type) VALUES (?, ?, ?, ?)')
+      .run(failedTask.id, 'system', `Troubleshooting failure (attempt ${retries + 1}/${MAX_RETRIES})...`, 'info')
+
+    // Ask Claude to diagnose the failure and suggest a fix
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 2048,
+      system: `You are a senior DevOps troubleshooter for Ember, a restaurant kitchen management SaaS (React 19 + Vite frontend, Express + PostgreSQL backend).
+
+A task just failed. Your job is to:
+1. Diagnose WHY it failed based on the error message and logs
+2. Determine if it's retryable (transient error, rate limit, timeout) vs permanent (bad logic, missing dependency)
+3. If retryable, provide an improved task description that avoids the failure
+4. If permanent, explain what needs to change
+
+Respond with ONLY valid JSON:
+{
+  "diagnosis": "Brief explanation of what went wrong",
+  "retryable": true/false,
+  "fix": "What to change to fix it",
+  "improved_description": "Updated task description for retry (only if retryable)"
+}`,
+      messages: [{
+        role: 'user',
+        content: `Failed task: "${failedTask.title}"
+Agent: ${agent.name} (${agent.role})
+Original description: ${failedTask.description || 'No description'}
+
+Error: ${errorMsg}
+
+Task logs:
+${logContext.slice(0, 2000)}`
+      }]
+    })
+
+    const text = response.content.map(b => b.type === 'text' ? b.text : '').join('')
+    const jsonMatch = text.match(/\{[\s\S]*\}/)
+    if (!jsonMatch) return
+
+    const diagnosis = JSON.parse(jsonMatch[0])
+
+    // Post diagnosis to chat
+    db.prepare('INSERT INTO messages (sender_id, sender_name, sender_avatar, sender_color, text) VALUES (?, ?, ?, ?, ?)')
+      .run('system', '🔧 Troubleshooter', '🔧', '#ef4444',
+        `🔍 Diagnosed "${failedTask.title}":\n\n**Problem:** ${diagnosis.diagnosis}\n**Fix:** ${diagnosis.fix}\n**Retryable:** ${diagnosis.retryable ? 'Yes — retrying now' : 'No — needs manual intervention'}`)
+
+    db.prepare('INSERT INTO task_logs (task_id, agent_id, message, type) VALUES (?, ?, ?, ?)')
+      .run(failedTask.id, 'system', `Diagnosis: ${diagnosis.diagnosis}\nFix: ${diagnosis.fix}`, 'warning')
+
+    if (diagnosis.retryable && diagnosis.improved_description) {
+      // Update the task with improved description and reset for retry
+      const newDesc = `${diagnosis.improved_description}\n\n---\n⚠️ Previous attempt failed: ${diagnosis.diagnosis}\nFix applied: ${diagnosis.fix}`
+      db.prepare(`UPDATE tasks SET status = 'todo', description = ?, error = '', retries = ?, completed_at = NULL, started_at = NULL, updated_at = datetime('now') WHERE id = ?`)
+        .run(newDesc, retries + 1, failedTask.id)
+
+      db.prepare('INSERT INTO task_logs (task_id, agent_id, message, type) VALUES (?, ?, ?, ?)')
+        .run(failedTask.id, 'system', `Task reset for retry (${retries + 1}/${MAX_RETRIES}) with improved description`, 'info')
+
+      // Auto-run the retry after a short delay
+      setTimeout(async () => {
+        try {
+          const freshTask = db.prepare('SELECT * FROM tasks WHERE id = ?').get(failedTask.id)
+          if (!freshTask || freshTask.status !== 'todo') return
+          // Trigger the run internally
+          const runRes = await fetch(`http://localhost:${process.env.PORT || process.env.API_PORT || 3334}/api/tasks/${failedTask.id}/run`, { method: 'POST' })
+          if (runRes.ok) {
+            console.log(`🔧 Auto-retrying "${failedTask.title}" (attempt ${retries + 2})`)
+          }
+        } catch (e) {
+          console.error('Auto-retry fetch failed:', e.message)
+        }
+      }, 3000)
+    } else {
+      // Not retryable — mark as needs manual attention
+      db.prepare('INSERT INTO task_logs (task_id, agent_id, message, type) VALUES (?, ?, ?, ?)')
+        .run(failedTask.id, 'system', 'Task requires manual intervention — not auto-retryable', 'error')
+    }
+
+    console.log(`🔧 Troubleshot "${failedTask.title}": ${diagnosis.retryable ? 'retrying' : 'needs manual fix'}`)
+  } catch (err) {
+    console.error('Troubleshooting failed:', err.message)
+  }
+}
+
 // ── Agents ─────────────────────────────────────────
 app.get('/api/agents', (req, res) => {
   const taskCounts = db.prepare(`
@@ -362,6 +463,11 @@ app.post('/api/tasks/:id/run', async (req, res) => {
       tag: `task-fail-${task.id}`,
       taskId: task.id
     })
+
+    // Auto-troubleshoot & retry (skip if user manually stopped)
+    if (err.name !== 'AbortError') {
+      troubleshootAndRetry(task, agent, errorMsg).catch(() => {})
+    }
   }
 })
 
