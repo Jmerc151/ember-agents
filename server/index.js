@@ -124,6 +124,90 @@ Generate follow-up tasks as JSON array:`
   }
 }
 
+// ── QA Review — Sentinel auto-reviews completed work ────────
+async function reviewCompletedWork(completedTask, agent, output) {
+  try {
+    // Don't review Sentinel's own work (avoid infinite loop)
+    if (agent.id === 'sentinel') return
+
+    const sentinel = agents.find(a => a.id === 'sentinel')
+    if (!sentinel) return
+
+    db.prepare('INSERT INTO task_logs (task_id, agent_id, message, type) VALUES (?, ?, ?, ?)')
+      .run(completedTask.id, 'sentinel', 'Sentinel is reviewing this work...', 'info')
+
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 4096,
+      system: `You are Sentinel, a senior QA engineer reviewing work output from the Ember development team (restaurant kitchen management SaaS — React 19 + Vite frontend, Express + PostgreSQL backend).
+
+Your job is to review the agent's work output and evaluate:
+1. **Correctness** — Does the code/plan look correct? Any bugs or logic errors?
+2. **Completeness** — Did it fully address the task requirements?
+3. **Quality** — Code style, best practices, edge cases, error handling?
+4. **Security** — Any SQL injection, XSS, auth issues, data leaks?
+5. **Performance** — Any obvious performance problems?
+
+Provide a clear verdict and score. Be specific about issues found.
+
+Format your response as:
+**Score: X/10**
+**Verdict: PASS | NEEDS WORK | FAIL**
+
+Then explain your findings concisely. If NEEDS WORK or FAIL, list specific issues that need fixing.`,
+      messages: [{
+        role: 'user',
+        content: `Review this completed work:
+
+**Task:** ${completedTask.title}
+**Agent:** ${agent.name} (${agent.role})
+**Description:** ${completedTask.description || 'No description'}
+
+**Agent Output (first 4000 chars):**
+${output.slice(0, 4000)}`
+      }]
+    })
+
+    const review = response.content.map(b => b.type === 'text' ? b.text : '').join('')
+
+    // Extract verdict
+    const verdictMatch = review.match(/Verdict:\s*(PASS|NEEDS WORK|FAIL)/i)
+    const scoreMatch = review.match(/Score:\s*(\d+)\/10/i)
+    const verdict = verdictMatch ? verdictMatch[1].toUpperCase() : 'UNKNOWN'
+    const score = scoreMatch ? parseInt(scoreMatch[1]) : null
+
+    // Log the review
+    db.prepare('INSERT INTO task_logs (task_id, agent_id, message, type) VALUES (?, ?, ?, ?)')
+      .run(completedTask.id, 'sentinel', review.slice(0, 5000), verdict === 'PASS' ? 'success' : 'warning')
+
+    // Post review to chat
+    const emoji = verdict === 'PASS' ? '✅' : verdict === 'FAIL' ? '🚨' : '⚠️'
+    const shortReview = review.length > 500 ? review.slice(0, 500) + '…' : review
+    db.prepare('INSERT INTO messages (sender_id, sender_name, sender_avatar, sender_color, text) VALUES (?, ?, ?, ?, ?)')
+      .run('sentinel', sentinel.name, sentinel.avatar, sentinel.color,
+        `${emoji} **Review of "${completedTask.title}"** (by ${agent.name}):\n\n${shortReview}`)
+
+    // If FAIL or low score, create a fix task for the original agent
+    if (verdict === 'FAIL' || (score !== null && score <= 4)) {
+      const fixId = uuid()
+      db.prepare(`
+        INSERT INTO tasks (id, title, description, priority, agent_id, status)
+        VALUES (?, ?, ?, 'high', ?, 'todo')
+      `).run(fixId, `Fix issues: ${completedTask.title}`, `Sentinel review found critical issues:\n\n${review.slice(0, 2000)}`, agent.id)
+
+      db.prepare('INSERT INTO messages (sender_id, sender_name, sender_avatar, sender_color, text) VALUES (?, ?, ?, ?, ?)')
+        .run('sentinel', sentinel.name, sentinel.avatar, sentinel.color,
+          `🔁 Created fix task for ${agent.name}: issues found in "${completedTask.title}"`)
+
+      console.log(`🛡️ Sentinel FAILED "${completedTask.title}" — fix task created for ${agent.name}`)
+    }
+
+    console.log(`🛡️ Sentinel reviewed "${completedTask.title}": ${verdict} ${score ? `(${score}/10)` : ''}`)
+  } catch (err) {
+    console.error('QA review failed:', err.message)
+  }
+}
+
 // ── Agents ─────────────────────────────────────────
 app.get('/api/agents', (req, res) => {
   const taskCounts = db.prepare(`
@@ -255,8 +339,10 @@ app.post('/api/tasks/:id/run', async (req, res) => {
       taskId: task.id
     })
 
-    // Auto-generate follow-up tasks
-    generateFollowUpTasks(task, agent, output).catch(() => {})
+    // QA Review — Sentinel checks the work, then generate follow-ups
+    reviewCompletedWork(task, agent, output)
+      .then(() => generateFollowUpTasks(task, agent, output))
+      .catch(() => {})
   } catch (err) {
     activeRuns.delete(agent.id)
     const errorMsg = err.name === 'AbortError' ? 'Stopped by user' : err.message
