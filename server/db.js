@@ -48,4 +48,7 @@ db.exec(`
 // Add retries column if not exists (migration-safe)
 try { db.exec(`ALTER TABLE tasks ADD COLUMN retries INTEGER DEFAULT 0`) } catch (e) { /* already exists */ }
 
+// Add depth column to track follow-up generations (0 = original, 1 = follow-up, etc.)
+try { db.exec(`ALTER TABLE tasks ADD COLUMN depth INTEGER DEFAULT 0`) } catch (e) { /* already exists */ }
+
 export default db

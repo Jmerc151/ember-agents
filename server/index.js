@@ -224,9 +224,48 @@ ${toMemory.slice(-1500) || '(no prior knowledge)'}`,
 
 
 // ── Auto Task Generation ────────────────────────────
+// Guards against infinite recursion:
+//   1. MAX_TASK_DEPTH: follow-ups of follow-ups are NOT allowed (depth > 1 = stop)
+//   2. DAILY_TASK_CAP: max new tasks created per day
+//   3. PENDING_TASK_CAP: stop if too many tasks already queued
+const MAX_TASK_DEPTH = 1      // 0 = original, 1 = first follow-up, no deeper
+const DAILY_TASK_CAP = 20     // max auto-generated tasks per day
+const PENDING_TASK_CAP = 30   // stop generating if this many todo tasks exist
+
 async function generateFollowUpTasks(completedTask, agent, output) {
   try {
-    const allTasks = db.prepare('SELECT title, status, agent_id FROM tasks ORDER BY created_at DESC LIMIT 20').all()
+    // ── Guard 1: Depth limit ──
+    const taskDepth = completedTask.depth || 0
+    if (taskDepth >= MAX_TASK_DEPTH) {
+      console.log(`🧠 Skipping follow-up generation: "${completedTask.title}" is at depth ${taskDepth} (max: ${MAX_TASK_DEPTH})`)
+      return
+    }
+
+    // ── Guard 2: Daily cap ──
+    const todayCount = db.prepare(
+      "SELECT COUNT(*) as count FROM tasks WHERE created_at >= date('now') AND depth > 0"
+    ).get().count
+    if (todayCount >= DAILY_TASK_CAP) {
+      console.log(`🧠 Skipping follow-up generation: daily cap reached (${todayCount}/${DAILY_TASK_CAP})`)
+      return
+    }
+
+    // ── Guard 3: Pending task cap ──
+    const pendingCount = db.prepare(
+      "SELECT COUNT(*) as count FROM tasks WHERE status = 'todo'"
+    ).get().count
+    if (pendingCount >= PENDING_TASK_CAP) {
+      console.log(`🧠 Skipping follow-up generation: ${pendingCount} tasks already queued (max: ${PENDING_TASK_CAP})`)
+      return
+    }
+
+    // How many we're allowed to create (respect both caps)
+    const remainingDaily = DAILY_TASK_CAP - todayCount
+    const remainingPending = PENDING_TASK_CAP - pendingCount
+    const maxToCreate = Math.min(3, remainingDaily, remainingPending)
+    if (maxToCreate <= 0) return
+
+    const allTasks = db.prepare('SELECT title, status, agent_id FROM tasks ORDER BY created_at DESC LIMIT 30').all()
     const taskContext = allTasks.map(t => `- [${t.status}] ${t.title}`).join('\n')
 
     const response = await anthropic.messages.create({
@@ -237,9 +276,15 @@ async function generateFollowUpTasks(completedTask, agent, output) {
 Available agents and their specialties:
 ${agents.map(a => `- ${a.id}: ${a.name} (${a.role}) — ${a.description}`).join('\n')}
 
-Generate 1-3 follow-up tasks based on completed work. Each task should be actionable, specific, and assigned to the most appropriate agent. Focus on real improvements: bug fixes, tests, optimizations, new features, or polish.
+Generate 1-${maxToCreate} follow-up tasks based on completed work. Each task should be:
+- HIGH-IMPACT: Real features, critical bugs, or important infrastructure — not micro-optimizations
+- DISTINCT: Meaningfully different from existing tasks — not slight variations
+- ACTIONABLE: Concrete enough for an agent to execute independently
 
-IMPORTANT: Do NOT duplicate existing tasks. Do NOT create vague tasks. Each must be concrete enough for an agent to execute.
+Do NOT generate:
+- Tests for tests, or reviews of reviews (no recursive meta-tasks)
+- Minor polish or cosmetic improvements
+- Tasks that are slight variations of existing ones (check the list carefully)
 
 Respond with ONLY valid JSON — an array of objects with: title, description, agent_id, priority (low/medium/high)`,
       messages: [{
@@ -263,25 +308,26 @@ Generate follow-up tasks as JSON array:`
 
     const newTasks = JSON.parse(jsonMatch[0])
     const created = []
+    const newDepth = taskDepth + 1
 
-    for (const t of newTasks.slice(0, 3)) {
+    for (const t of newTasks.slice(0, maxToCreate)) {
       const validAgent = agents.find(a => a.id === t.agent_id)
       if (!validAgent || !t.title) continue
 
       const id = uuid()
       db.prepare(`
-        INSERT INTO tasks (id, title, description, priority, agent_id, status)
-        VALUES (?, ?, ?, ?, ?, 'todo')
-      `).run(id, t.title, t.description || '', t.priority || 'medium', t.agent_id)
+        INSERT INTO tasks (id, title, description, priority, agent_id, status, depth)
+        VALUES (?, ?, ?, ?, ?, 'todo', ?)
+      `).run(id, t.title, t.description || '', t.priority || 'medium', t.agent_id, newDepth)
       created.push({ title: t.title, agent: validAgent.name, agentId: t.agent_id })
     }
 
     if (created.length > 0) {
       const taskList = created.map(t => `• ${t.title} → ${t.agent}`).join('\n')
       db.prepare('INSERT INTO messages (sender_id, sender_name, sender_avatar, sender_color, text) VALUES (?, ?, ?, ?, ?)')
-        .run('system', '🧠 Task Planner', '🧠', '#a855f7', `Generated ${created.length} follow-up task${created.length > 1 ? 's' : ''}:\n${taskList}`)
+        .run('system', '🧠 Task Planner', '🧠', '#a855f7', `Generated ${created.length} follow-up task${created.length > 1 ? 's' : ''} (depth ${newDepth}, ${todayCount + created.length}/${DAILY_TASK_CAP} today):\n${taskList}`)
 
-      console.log(`🧠 Auto-generated ${created.length} follow-up tasks from "${completedTask.title}"`)
+      console.log(`🧠 Auto-generated ${created.length} follow-up tasks from "${completedTask.title}" (depth ${newDepth}, daily: ${todayCount + created.length}/${DAILY_TASK_CAP})`)
 
       // Trigger queue processing for agents that got new tasks
       const affectedAgents = [...new Set(created.map(t => t.agentId))]
