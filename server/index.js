@@ -34,6 +34,10 @@ if (API_KEY) {
 // Anthropic client
 const anthropic = new Anthropic() // uses ANTHROPIC_API_KEY env var
 
+// Model routing — Sonnet for real work, Haiku for overhead
+const TASK_MODEL = 'claude-sonnet-4-20250514'       // Agent task execution (ReAct loop)
+const OVERHEAD_MODEL = 'claude-haiku-4-5-20251001'   // Memory, QA, follow-ups, troubleshooting, standups
+
 // Web Push setup
 const VAPID_PUBLIC = process.env.VAPID_PUBLIC_KEY || 'BJzTO_33QaJQKmSo6s639IQ8O3VdYIYB2AgcMmGA_6zroPrWL8UHho56bOqSp6pav6YGVFkdwe15ZnmVW6Z8W3M'
 const VAPID_PRIVATE = process.env.VAPID_PRIVATE_KEY || 'vkrHsFUbb4ZnhroYqUA5MzZzu8cbK1ZnTlltkf6_ixg'
@@ -93,7 +97,7 @@ async function updateAgentMemory(agent, task, output) {
     const currentMemory = readAgentMemory(agent.id)
 
     const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: OVERHEAD_MODEL,
       max_tokens: 1024,
       system: `You are a memory curator for ${agent.name} (${agent.role}). Extract the most important learnings, decisions, and context from completed work that would help this agent perform better on future tasks.
 
@@ -191,7 +195,7 @@ async function agentConsult(fromAgent, toAgentId, question, taskContext) {
     const toMemory = readAgentMemory(toAgentId)
 
     const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: OVERHEAD_MODEL,
       max_tokens: 2048,
       system: `${toAgent.systemPrompt}
 
@@ -269,7 +273,7 @@ async function generateFollowUpTasks(completedTask, agent, output) {
     const taskContext = allTasks.map(t => `- [${t.status}] ${t.title}`).join('\n')
 
     const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: OVERHEAD_MODEL,
       max_tokens: 2048,
       system: `You are a technical project manager for Ember, a restaurant kitchen management SaaS (React 19 + Vite frontend, Express + PostgreSQL backend).
 
@@ -354,7 +358,7 @@ async function reviewCompletedWork(completedTask, agent, output) {
       .run(completedTask.id, 'sentinel', 'Sentinel is reviewing this work...', 'info')
 
     const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: OVERHEAD_MODEL,
       max_tokens: 4096,
       system: `You are Sentinel, a senior QA engineer reviewing work output from the Ember development team (restaurant kitchen management SaaS — React 19 + Vite frontend, Express + PostgreSQL backend).
 
@@ -445,7 +449,7 @@ async function troubleshootAndRetry(failedTask, agent, errorMsg) {
       .run(failedTask.id, 'system', `Troubleshooting failure (attempt ${retries + 1}/${MAX_RETRIES})...`, 'info')
 
     const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: OVERHEAD_MODEL,
       max_tokens: 2048,
       system: `You are a senior DevOps troubleshooter for Ember, a restaurant kitchen management SaaS (React 19 + Vite frontend, Express + PostgreSQL backend).
 
@@ -553,7 +557,7 @@ registerHeartbeat('memory-compaction', 24 * 60 * 60 * 1000, async () => {
     if (memory.length > 10000) {
       try {
         const response = await anthropic.messages.create({
-          model: 'claude-sonnet-4-20250514',
+          model: OVERHEAD_MODEL,
           max_tokens: 2048,
           system: `Compact this agent memory to the most important 50% of content. Keep the most valuable learnings, remove redundant or outdated entries. Preserve markdown formatting.`,
           messages: [{ role: 'user', content: memory }]
@@ -738,7 +742,7 @@ Start by analyzing the task and providing your approach.`
         .run(task.id, agent.id, `ReAct step ${step + 1}/${MAX_STEPS}...`, 'info')
 
       const response = await anthropic.messages.create({
-        model: 'claude-sonnet-4-20250514',
+        model: TASK_MODEL,
         max_tokens: 8192,
         system: agent.systemPrompt,
         messages,
@@ -907,7 +911,7 @@ app.post('/api/chat/standup', async (req, res) => {
 
   try {
     const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: OVERHEAD_MODEL,
       max_tokens: 2048,
       messages: [{
         role: 'user',
